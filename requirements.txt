@@ -4,3 +4,6 @@ google-auth-httplib2
 google-auth-oauthlib
 fastapi
 uvicorn[standard]
+itsdangerous
+python-multipart
+requests
