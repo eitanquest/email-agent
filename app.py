@@ -258,6 +258,12 @@ async def auth_login(request: Request):
     flow = _make_flow()
     auth_url, state = flow.authorization_url(access_type="offline", prompt="consent")
     request.session["oauth_state"] = state
+    # Save code_verifier so the callback can complete PKCE token exchange
+    code_verifier = getattr(flow.oauth2session, "_client", None)
+    if code_verifier:
+        cv = getattr(code_verifier, "code_verifier", None)
+        if cv:
+            request.session["oauth_code_verifier"] = cv
     return RedirectResponse(auth_url)
 
 
@@ -269,7 +275,8 @@ async def auth_callback(request: Request, code: str = None, state: str = None, e
         return HTMLResponse("Invalid OAuth state — please try signing in again.", status_code=400)
 
     flow = _make_flow()
-    flow.fetch_token(code=code)
+    code_verifier = request.session.pop("oauth_code_verifier", None)
+    flow.fetch_token(code=code, code_verifier=code_verifier)
     creds = flow.credentials
 
     # Get user profile
