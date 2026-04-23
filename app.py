@@ -27,12 +27,13 @@ import secrets
 import threading
 from typing import AsyncIterator
 
+import urllib.parse
+
 import anthropic
 import requests as http_requests
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from starlette.middleware.sessions import SessionMiddleware
 
@@ -48,12 +49,15 @@ app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, https_only=Fals
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
 REDIRECT_URI = f"{BASE_URL}/auth/callback"
 
-SCOPES = [
+SCOPES = " ".join([
     "https://www.googleapis.com/auth/gmail.readonly",
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
-]
+])
+
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -79,30 +83,14 @@ def _load_agent_config() -> dict:
 # OAuth helpers
 # ---------------------------------------------------------------------------
 
-def _make_flow() -> Flow:
-    return Flow.from_client_config(
-        {
-            "web": {
-                "client_id": os.environ["GMAIL_CLIENT_ID"],
-                "client_secret": os.environ["GMAIL_CLIENT_SECRET"],
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [REDIRECT_URI],
-            }
-        },
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
-    )
-
-
 def _creds_from_session(token_dict: dict) -> Credentials:
     return Credentials(
         token=token_dict["token"],
         refresh_token=token_dict.get("refresh_token"),
-        token_uri=token_dict.get("token_uri", "https://oauth2.googleapis.com/token"),
+        token_uri=token_dict.get("token_uri", GOOGLE_TOKEN_URL),
         client_id=token_dict["client_id"],
         client_secret=token_dict["client_secret"],
-        scopes=token_dict.get("scopes", SCOPES),
+        scopes=token_dict.get("scopes", SCOPES.split()),
     )
 
 
@@ -255,16 +243,18 @@ async def _sse_stream(prompt: str, max_results: int, gmail_token: dict) -> Async
 
 @app.get("/auth/login")
 async def auth_login(request: Request):
-    flow = _make_flow()
-    auth_url, state = flow.authorization_url(access_type="offline", prompt="consent")
+    state = secrets.token_urlsafe(32)
     request.session["oauth_state"] = state
-    # Save code_verifier so the callback can complete PKCE token exchange
-    code_verifier = getattr(flow.oauth2session, "_client", None)
-    if code_verifier:
-        cv = getattr(code_verifier, "code_verifier", None)
-        if cv:
-            request.session["oauth_code_verifier"] = cv
-    return RedirectResponse(auth_url)
+    params = urllib.parse.urlencode({
+        "client_id": os.environ["GMAIL_CLIENT_ID"],
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "scope": SCOPES,
+        "state": state,
+        "access_type": "offline",
+        "prompt": "consent",
+    })
+    return RedirectResponse(f"{GOOGLE_AUTH_URL}?{params}")
 
 
 @app.get("/auth/callback")
@@ -274,26 +264,32 @@ async def auth_callback(request: Request, code: str = None, state: str = None, e
     if not code or state != request.session.get("oauth_state"):
         return HTMLResponse("Invalid OAuth state — please try signing in again.", status_code=400)
 
-    flow = _make_flow()
-    code_verifier = request.session.pop("oauth_code_verifier", None)
-    flow.fetch_token(code=code, code_verifier=code_verifier)
-    creds = flow.credentials
+    token_resp = http_requests.post(GOOGLE_TOKEN_URL, data={
+        "code": code,
+        "client_id": os.environ["GMAIL_CLIENT_ID"],
+        "client_secret": os.environ["GMAIL_CLIENT_SECRET"],
+        "redirect_uri": REDIRECT_URI,
+        "grant_type": "authorization_code",
+    }, timeout=15)
+    token_data = token_resp.json()
 
-    # Get user profile
+    if "error" in token_data:
+        return HTMLResponse(f"Token error: {token_data.get('error_description', token_data['error'])}", status_code=400)
+
     user_resp = http_requests.get(
         "https://www.googleapis.com/oauth2/v2/userinfo",
-        headers={"Authorization": f"Bearer {creds.token}"},
+        headers={"Authorization": f"Bearer {token_data['access_token']}"},
         timeout=10,
     )
     profile = user_resp.json() if user_resp.ok else {}
 
     request.session["gmail_token"] = {
-        "token": creds.token,
-        "refresh_token": creds.refresh_token,
-        "token_uri": creds.token_uri,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": list(creds.scopes) if creds.scopes else SCOPES,
+        "token": token_data["access_token"],
+        "refresh_token": token_data.get("refresh_token"),
+        "token_uri": GOOGLE_TOKEN_URL,
+        "client_id": os.environ["GMAIL_CLIENT_ID"],
+        "client_secret": os.environ["GMAIL_CLIENT_SECRET"],
+        "scopes": SCOPES.split(),
     }
     request.session["user_name"] = profile.get("name", "")
     request.session["user_email"] = profile.get("email", "")
