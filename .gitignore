@@ -1,0 +1,7 @@
+token.json
+credentials.json
+agent_config.json
+__pycache__/
+*.pyc
+.env
+.DS_Store
