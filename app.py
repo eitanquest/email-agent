@@ -161,7 +161,7 @@ def _run_session(config: dict, prompt: str, max_results: int, gmail_token: dict,
             environment_id=config["environment_id"],
         )
 
-        with client.beta.sessions.stream(session_id=session.id) as stream:
+        with client.beta.sessions.events.stream(session_id=session.id) as stream:
             client.beta.sessions.events.send(
                 session_id=session.id,
                 events=[{"type": "user.message", "content": [{"type": "text", "text": prompt}]}],
